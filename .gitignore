@@ -1,0 +1,4 @@
+node_modules/
+*.db
+# Personal interview notes - not part of the submission
+INTERVIEW_PREP.md
