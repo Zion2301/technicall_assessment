@@ -29,8 +29,9 @@ export interface Claim {
 export class PayoutProcessor {
   constructor(private readonly ctx: AppContext) {}
 
-  /** One full cycle of work. */
+  /** One full cycle of work: resolve what's uncertain first, then send what's due. */
   async tick(): Promise<void> {
+    await this.reconcileOpenAttempts();
     await this.processDuePayouts();
   }
 
@@ -121,6 +122,126 @@ export class PayoutProcessor {
     }
     applyAttemptOutcome(this.ctx, claim.attemptId, fromSendResult(result), 'processor', { response: result });
   }
+
+  // -------------------------------------------------------------------------
+  // Reconciliation: resolving attempts whose outcome we don't know.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Finds attempts that have been open too long (timed out, crashed mid-send,
+   * accepted but no webhook arrived) and asks the provider what happened,
+   * using the SAME reference. This is how we resolve "did the money move?"
+   * without guessing.
+   */
+  async reconcileOpenAttempts(): Promise<number> {
+    const { db, clock, config } = this.ctx;
+    const stale = db
+      .prepare(
+        `SELECT a.id, a.payout_id, a.attempt_number, a.provider, a.provider_reference, a.status,
+                p.amount_minor, p.currency, p.recipient_json
+           FROM payout_attempts a JOIN payouts p ON p.id = a.payout_id
+          WHERE a.status IN ('in_flight', 'accepted', 'unknown') AND a.updated_at <= ?
+          ORDER BY a.updated_at LIMIT ?`,
+      )
+      .all(clock.now() - config.staleAttemptMs, config.batchSize) as OpenAttemptRow[];
+
+    for (const row of stale) await this.reconcileAttempt(row);
+    return stale.length;
+  }
+
+  private async reconcileAttempt(row: OpenAttemptRow): Promise<void> {
+    const provider = this.ctx.providers.byName(row.provider);
+
+    let status;
+    try {
+      status = await provider.getPayoutStatus(row.provider_reference);
+    } catch (err) {
+      this.recordInconclusiveCheck(row, `status check failed: ${describeError(err)}`);
+      return;
+    }
+
+    switch (status.status) {
+      case 'succeeded':
+        applyAttemptOutcome(this.ctx, row.id, { kind: 'succeeded' }, 'reconciler', { statusCheck: status });
+        return;
+
+      case 'failed':
+        applyAttemptOutcome(this.ctx, row.id, { kind: 'failed', code: status.code, retryable: status.retryable }, 'reconciler', { statusCheck: status });
+        return;
+
+      case 'pending':
+        // The provider has it and is still working on it. Nothing to do but wait.
+        applyAttemptOutcome(this.ctx, row.id, { kind: 'accepted' }, 'reconciler', { statusCheck: status });
+        this.recordInconclusiveCheck(row, 'provider still processing');
+        return;
+
+      case 'not_found':
+        if (row.status === 'accepted') {
+          // The provider acknowledged this reference earlier and now denies it exists.
+          // Something is badly wrong on their side: a human must look.
+          this.escalate(row, 'Provider acknowledged this transfer earlier but now has no record of it');
+          return;
+        }
+        // The request never reached the provider (timed out before arrival, or we
+        // crashed before sending). Resending is safe ONLY because we reuse the
+        // same reference: if the original request does turn up late, the
+        // provider de-duplicates it.
+        await this.resend(row);
+        return;
+    }
+  }
+
+  private async resend(row: OpenAttemptRow): Promise<void> {
+    const provider = this.ctx.providers.byName(row.provider);
+    try {
+      const result = await provider.sendPayout({
+        reference: row.provider_reference, // same reference: never a new one here
+        amountMinor: row.amount_minor,
+        currency: row.currency,
+        recipient: JSON.parse(row.recipient_json) as Recipient,
+      });
+      applyAttemptOutcome(this.ctx, row.id, fromSendResult(result), 'reconciler', { resent: true, response: result });
+    } catch (err) {
+      applyAttemptOutcome(this.ctx, row.id, { kind: 'unknown', reason: describeError(err) }, 'reconciler');
+      this.recordInconclusiveCheck(row, `resend with same reference failed: ${describeError(err)}`);
+    }
+  }
+
+  /**
+   * Counts a check that didn't settle anything. After too many, a human takes
+   * over. The attempt stays open, though: we keep polling, and a late webhook
+   * or status check can still resolve it automatically.
+   */
+  private recordInconclusiveCheck(row: OpenAttemptRow, why: string): void {
+    const { db, clock, config } = this.ctx;
+    db.transaction(() => {
+      db.prepare(`UPDATE payout_attempts SET status_checks = status_checks + 1, updated_at = ? WHERE id = ?`).run(clock.now(), row.id);
+      const checks = db.prepare(`SELECT status_checks FROM payout_attempts WHERE id = ?`).pluck().get(row.id) as number;
+      if (checks >= config.maxStatusChecks) {
+        this.escalate(row, `Outcome still unresolved after ${checks} status checks (last: ${why})`);
+      }
+    })();
+  }
+
+  private escalate(row: OpenAttemptRow, reason: string): void {
+    // Only escalates from processing; if it's already in needs_review this is a no-op (CAS fails).
+    transitionPayout(this.ctx.db, {
+      payoutId: row.payout_id, from: 'processing', to: 'needs_review', actor: 'reconciler',
+      at: this.ctx.clock.now(), reason, metadata: { reference: row.provider_reference },
+    });
+  }
+}
+
+interface OpenAttemptRow {
+  id: string;
+  payout_id: string;
+  attempt_number: number;
+  provider: string;
+  provider_reference: string;
+  status: 'in_flight' | 'accepted' | 'unknown';
+  amount_minor: number;
+  currency: Currency;
+  recipient_json: string;
 }
 
 export function fromSendResult(result: SendResult): AttemptOutcome {
