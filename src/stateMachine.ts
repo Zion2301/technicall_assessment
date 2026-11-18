@@ -7,7 +7,8 @@
  *                 │   └── awaiting_retry   (definite, retryable failure)
  *                 ├─────► failed           (non-retryable, or retries exhausted)
  *                 └─────► needs_review     (outcome can't be determined automatically)
- *   needs_review ──► succeeded | failed    (late evidence or an operator decision)
+ *   awaiting_retry ──► needs_review        (conflicting evidence: stop retrying)
+ *   needs_review ──► succeeded | failed | awaiting_retry   (late evidence or an operator decision)
  */
 export const PAYOUT_STATUSES = [
   'pending',
@@ -23,8 +24,8 @@ export type PayoutStatus = (typeof PAYOUT_STATUSES)[number];
 const ALLOWED_TRANSITIONS: Record<PayoutStatus, readonly PayoutStatus[]> = {
   pending: ['processing'],
   processing: ['succeeded', 'awaiting_retry', 'failed', 'needs_review'],
-  awaiting_retry: ['processing'],
-  needs_review: ['succeeded', 'failed'],
+  awaiting_retry: ['processing', 'needs_review'],
+  needs_review: ['succeeded', 'failed', 'awaiting_retry'],
   succeeded: [], // terminal: money has left. Reversals would be a new flow, not a status flip.
   failed: [], // terminal: funds released back to the company.
 };

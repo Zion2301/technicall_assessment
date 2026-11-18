@@ -89,6 +89,8 @@ CREATE INDEX IF NOT EXISTS idx_events_payout ON payout_events (payout_id, id);
 
 -- Double-entry ledger: every txn_id has entries that sum to zero per currency.
 -- Answers "where is the money right now?"
+-- txn_id is deterministic ("settle:<payout_id>"), so UNIQUE(txn_id, account)
+-- makes it physically impossible to settle or refund the same payout twice.
 CREATE TABLE IF NOT EXISTS ledger_entries (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   txn_id        TEXT NOT NULL,
@@ -97,7 +99,8 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
   amount_minor  INTEGER NOT NULL CHECK (amount_minor <> 0),  -- signed: +debit / -credit
   payout_id     TEXT REFERENCES payouts(id),
   description   TEXT NOT NULL,
-  created_at    INTEGER NOT NULL
+  created_at    INTEGER NOT NULL,
+  UNIQUE (txn_id, account)
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_payout ON ledger_entries (payout_id);
 
