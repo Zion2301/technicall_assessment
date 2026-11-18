@@ -53,3 +53,18 @@ export function transitionPayout(db: DB, t: TransitionInput): boolean {
     return true;
   })();
 }
+
+/**
+ * Records something noteworthy that does NOT change status, e.g. a webhook
+ * contradicting a payout that has already succeeded. Shows up in the audit
+ * trail with from_status = to_status.
+ */
+export function recordPayoutNote(
+  db: DB,
+  n: { payoutId: string; status: PayoutStatus; actor: Actor; reason: string; at: number; metadata?: Record<string, unknown> },
+): void {
+  db.prepare(
+    `INSERT INTO payout_events (payout_id, from_status, to_status, actor, reason, metadata, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(n.payoutId, n.status, n.status, n.actor, n.reason, n.metadata ? JSON.stringify(n.metadata) : null, n.at);
+}
