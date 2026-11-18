@@ -156,4 +156,3 @@ The same functions (`payoutHistory`, `formatPayoutHistory`) would back a support
 5. **Observability:** alerts on `needs_review`, conflicts and growing unknown-outcome counts. Per-provider success rates and latency. Circuit breakers so a down provider pauses sends instead of spending retries.
 6. **Per-provider rate limiting and bounded concurrency**, and batching for 100k+ employee runs.
 7. **Security:** encrypt recipient details at rest, restrict who can see them, and keep immutable audit retention for compliance.
-# technicall_assessment
